@@ -737,8 +737,9 @@ namespace pipewire {
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerates[1]), 0);
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_CHOICE_RANGE_Fraction(&framerates[0], &framerates[1], &framerates[2]), 0);
       } else {
-        // Request target framerate (target_framerate) for framerate in fallback case
-        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerates[0]), 0);
+        // Request target framerate (target_framerate) for framerate in fallback case, as a range so that
+        // producers advertising only a fixed framerate (e.g. COSMIC offers 60/1) can still be matched
+        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&framerates[0], &framerates[1], &framerates[2]), 0);
       }
 
       if (format == SPA_VIDEO_FORMAT_xBGR_210LE) {
