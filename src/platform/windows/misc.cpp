@@ -165,6 +165,15 @@ namespace platf {
     return std::filesystem::path {sunshine_path}.remove_filename() / L"config"sv;
   }
 
+  /**
+   * @brief XDG Portal token path (unused on Windows).
+   *
+   * @return Path of portal_token in appdata path.
+   */
+  std::filesystem::path get_xdg_restore_token_path() {
+    return appdata() / "portal_token";
+  }
+
   std::string from_sockaddr(const sockaddr *const socket_address) {
     char data[INET6_ADDRSTRLEN] = {};
 
@@ -1118,20 +1127,24 @@ namespace platf {
     }
   }
 
+  /**
+   * @brief Set the calling thread's Windows scheduling priority.
+   */
   void adjust_thread_priority(thread_priority_e priority) {
     int win32_priority;
 
     switch (priority) {
-      case thread_priority_e::low:
+      using enum thread_priority_e;
+      case low:
         win32_priority = THREAD_PRIORITY_BELOW_NORMAL;
         break;
-      case thread_priority_e::normal:
+      case normal:
         win32_priority = THREAD_PRIORITY_NORMAL;
         break;
-      case thread_priority_e::high:
+      case high:
         win32_priority = THREAD_PRIORITY_ABOVE_NORMAL;
         break;
-      case thread_priority_e::critical:
+      case critical:
         win32_priority = THREAD_PRIORITY_HIGHEST;
         break;
       default:
