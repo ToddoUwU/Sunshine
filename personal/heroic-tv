@@ -74,12 +74,31 @@ downloading() {
 }
 heroic_pids() { local pid; for pid in $(members "$1" "$2"); do is_heroic_main "$pid" && echo "$pid"; done; }
 
+# stop_heroic PID: close one Heroic and the helpers it started. While a download or a game runs, Heroic answers a close
+# request with "There are pending operations, are you sure?" and waits for a click on a screen nobody is looking at.
+# So with a download running it's stopped outright, before its download helpers: that way the download queue file still
+# lists the download, and the next Heroic resumes it. (Helpers stopped first could be recorded as a failed download.)
+stop_heroic() {
+  local pid=$1 k; local -a kids busy=() left=()
+  mapfile -t kids < <(descendants "$pid")
+  for k in "${kids[@]}"; do is_download "$k" && busy+=("$k"); done
+  if ((${#busy[@]})); then
+    log "  Heroic $pid is downloading: stopped outright, so the download resumes in the next Heroic"
+    kill -KILL "$pid" 2>/dev/null
+  else
+    close "$HEROIC_GRACE" "$pid"
+  fi
+  for k in "${kids[@]}"; do alive "$k" && left+=("$k"); done
+  ((${#left[@]})) && close 3 "${left[@]}"
+  return 0
+}
+
 close_heroic() {
-  local sid=$1 cg=$2; local -a mains rest
+  local sid=$1 cg=$2 pid; local -a mains rest
   mapfile -t mains < <(heroic_pids "$sid" "$cg")
   if ((${#mains[@]} == 0)); then log "quit: Heroic was already closed"; else
     log "quit: closing Heroic: $(names "${mains[@]}")"
-    close "$HEROIC_GRACE" "${mains[@]}"
+    for pid in "${mains[@]}"; do stop_heroic "$pid"; done
   fi
   mapfile -t rest < <(members "$sid" "$cg" | grep -vx "$$")
   ((${#rest[@]})) && { log "  left behind, forced: $(names "${rest[@]}")"; kill -KILL "${rest[@]}" 2>/dev/null; }
@@ -156,6 +175,6 @@ fi
 # one to the streamed screen: close it. Its download queue is saved and resumes in the new one.
 for pid in $(running); do
   log "start: closing the Heroic that was already open ($pid)"
-  close "$HEROIC_GRACE" "$pid"
+  stop_heroic "$pid"
 done
 exec "$HEROIC" --console --fullscreen
