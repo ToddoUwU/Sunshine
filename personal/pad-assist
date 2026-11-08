@@ -2,12 +2,15 @@
 """pad-assist PROFILE -- COMMAND...: run COMMAND (a game) and, while it runs, turn controller input into the mouse and
 keyboard input the game wants. The controller keeps working as a controller too: nothing is grabbed, this only adds.
 
-For games whose menus only take a mouse (A.I.M. Racing), so they can be played from the couch with just a pad.
+For games with no controller support, or menus that only take a mouse (A.I.M. Racing, Abandon Ship), so they can be
+played from the couch with just a pad.
 Meant as a Heroic per-game wrapper (Game settings > Advanced > Wrapper command: exe = this file, arguments =
 "PROFILE --"); it then starts and stops with the game, from the desk or from a Sunshine tile.
 
-Profiles (PROFILES below):
-  aim   left stick moves the pointer, A clicks, Start = Esc, RT = Up arrow (accelerate), LT = Down arrow (brake)
+Profiles (PROFILES below); in all of them the left stick moves the pointer and A is a left click:
+  aim          Start = Esc, RT = Up arrow (accelerate), LT = Down arrow (brake). The game's own Gamepad controls drive.
+  abandonship  B = right click, RB = Space (active pause), View = Esc (menu), Start = Enter ("Play!" in the Unity
+               configuration dialog shown at every launch), D-pad = crew 1-4, right stick = mouse wheel (zoom)
 
 The pointer is an absolute pointing device, which COSMIC maps onto one screen (the ASUS, DP-1), so a stick can't push
 it onto the other screen, where a click would take the game out of focus.
@@ -24,11 +27,18 @@ PROFILES = {
         "buttons": {e.BTN_SOUTH: ("mouse", e.BTN_LEFT), e.BTN_START: ("key", e.KEY_ESC)},
         "triggers": {"right": e.KEY_UP, "left": e.KEY_DOWN},
     },
+    "abandonship": {
+        "buttons": {e.BTN_SOUTH: ("mouse", e.BTN_LEFT), e.BTN_EAST: ("mouse", e.BTN_RIGHT),
+                    e.BTN_TR: ("key", e.KEY_SPACE), e.BTN_SELECT: ("key", e.KEY_ESC), e.BTN_START: ("key", e.KEY_ENTER)},
+        "hat": {"up": e.KEY_1, "right": e.KEY_2, "down": e.KEY_3, "left": e.KEY_4},
+        "scroll": True,
+    },
 }
 W, H = 4096, 4096          # pointer device resolution (COSMIC scales it onto the screen)
 SPEED = 1.1                # full stick: screen widths per second
 DEADZONE = 0.18
 TRIGGER_ON, TRIGGER_OFF = 0.35, 0.2
+SCROLL_RATE = 12           # full right stick: wheel notches per second
 TICK = 1 / 125
 LOG = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "pad-assist.log")
 OWN = ("pad-assist pointer", "pad-assist keyboard")
@@ -59,12 +69,14 @@ class Pad:
     def __init__(self, dev):
         self.dev, caps = dev, dev.capabilities(absinfo=True)
         self.abs = {code: info for code, info in caps.get(e.EV_ABS, [])}
-        # Bluetooth Xbox pads (and Sunshine's copy of one) report the triggers as gas/brake (and the right stick as
-        # Z/RZ); xpad-style pads report the triggers as Z/RZ.
+        # Bluetooth Xbox pads (and Sunshine's copy of one) report the triggers as gas/brake and the right stick as
+        # Z/RZ; xpad-style pads report the triggers as Z/RZ and the right stick as RX/RY.
         if e.ABS_GAS in self.abs or e.ABS_BRAKE in self.abs:
             self.trig = {"right": e.ABS_GAS, "left": e.ABS_BRAKE}
+            self.rstick = (e.ABS_Z, e.ABS_RZ)
         else:
             self.trig = {"right": e.ABS_RZ, "left": e.ABS_Z}
+            self.rstick = (e.ABS_RX, e.ABS_RY)
         self.val = {code: info.value for code, info in self.abs.items()}
 
     def axis(self, code):  # -1..1 around the middle of the range
@@ -88,11 +100,12 @@ def main():
     prof = PROFILES[args[0]]
     cmd = args[2:] if args[1] == "--" else args[1:]
 
-    pointer = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+    prof.setdefault("triggers", {}); prof.setdefault("hat", {})
+    keys = {out for kind, out in prof["buttons"].values() if kind == "key"} | set(prof["triggers"].values()) | set(prof["hat"].values())
+    pointer = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE], e.EV_REL: [e.REL_WHEEL],
                       e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, W - 1, 0, 0, 0)), (e.ABS_Y, AbsInfo(0, 0, H - 1, 0, 0, 0))]},
                      name=OWN[0])
-    keyboard = UInput({e.EV_KEY: [e.KEY_ESC, e.KEY_ENTER, e.KEY_UP, e.KEY_DOWN, e.KEY_LEFT, e.KEY_RIGHT, e.KEY_SPACE]},
-                      name=OWN[1])
+    keyboard = UInput({e.EV_KEY: sorted(keys | {e.KEY_ESC})}, name=OWN[1])
     child = subprocess.Popen(cmd)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda s, f: child.send_signal(s))
@@ -101,6 +114,8 @@ def main():
     pads, skip = {}, ignored_ids()
     x, y = W / 2, H / 2
     held = {"right": False, "left": False}
+    hat_held = {}               # direction -> key held down
+    wheel = 0.0
     moved = False
     last_scan = 0.0
     stop = threading.Event()
@@ -132,6 +147,16 @@ def main():
                 for ev in pad.dev.read():
                     if ev.type == e.EV_ABS:
                         pad.val[ev.code] = ev.value
+                        if ev.code in (e.ABS_HAT0X, e.ABS_HAT0Y) and prof["hat"]:
+                            pair = ("left", "right") if ev.code == e.ABS_HAT0X else ("up", "down")
+                            want = {pair[0]} if ev.value < 0 else {pair[1]} if ev.value > 0 else set()
+                            for d in pair:
+                                key = prof["hat"].get(d)
+                                if key and d in want and d not in hat_held:
+                                    keyboard.write(e.EV_KEY, key, 1); keyboard.syn()
+                                    hat_held[d] = key
+                                elif d in hat_held and d not in want:
+                                    keyboard.write(e.EV_KEY, hat_held.pop(d), 0); keyboard.syn()
                     elif ev.type == e.EV_KEY and ev.code in prof["buttons"] and ev.value in (0, 1):
                         kind, out = prof["buttons"][ev.code]
                         dev = pointer if kind == "mouse" else keyboard
@@ -154,6 +179,17 @@ def main():
             if not moved:
                 moved = True
                 log("pointer in use")
+        # Right stick (up/down) to the mouse wheel.
+        if prof.get("scroll"):
+            ry = max((p.axis(p.rstick[1]) for p in pads.values()), key=abs, default=0.0)
+            if abs(ry) > DEADZONE:
+                wheel += ((abs(ry) - DEADZONE) / (1 - DEADZONE)) * SCROLL_RATE * TICK * (1 if ry > 0 else -1)
+                while abs(wheel) >= 1:
+                    step = 1 if wheel > 0 else -1
+                    pointer.write(e.EV_REL, e.REL_WHEEL, -step); pointer.syn()  # stick down = wheel down
+                    wheel -= step
+            else:
+                wheel = 0.0
         # Triggers to keys, with hysteresis.
         for side, key in prof["triggers"].items():
             t = max((p.trigger(side) for p in pads.values()), default=0.0)
@@ -165,6 +201,8 @@ def main():
     for side, key in prof["triggers"].items():
         if held[side]:
             keyboard.write(e.EV_KEY, key, 0); keyboard.syn()
+    for key in hat_held.values():
+        keyboard.write(e.EV_KEY, key, 0); keyboard.syn()
     pointer.close(); keyboard.close()
     log(f"stop {args[0]}: exit {child.returncode}")
     sys.exit(child.returncode if child.returncode is not None and child.returncode >= 0 else 1)
