@@ -15,7 +15,11 @@
 # Log: ~/.local/state/heroic-tv/tv.log
 #
 # Controllers: this PC's own pad, left connected at the desk, would otherwise take player 1 from the pad Moonlight
-# passes through. For anything started from here, only Moonlight's pad counts. Set HEROIC_TV_KEEP_LOCAL_PADS=1 to keep them.
+# passes through, and so would Steam's virtual copies of pads (28de:11ff, "Microsoft X-Box 360 pad N") while Steam runs.
+# For anything started from here, only Moonlight's pad counts. Set HEROIC_TV_KEEP_LOCAL_PADS=1 to keep them.
+#
+# MIDI: a game closed mid-song (DOSBox ones like Tyrian) leaves notes hanging in the always-on fluidsynth service, so
+# `quit` restarts it once a game has been closed (about a second; nothing else uses it).
 set -uo pipefail
 
 TILE_STATE=${HEROIC_TV_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/heroic-tv}
@@ -105,6 +109,14 @@ close_heroic() {
   return 0
 }
 
+# Silence notes a closed game left hanging in fluidsynth (a user service, when it runs). FLUIDSYNTH_UNIT="" skips it.
+reset_midi() {
+  local unit=${FLUIDSYNTH_UNIT-fluidsynth.service}
+  [[ -n $unit ]] && systemctl --user -q is-active "$unit" 2>/dev/null || return 0
+  systemctl --user restart "$unit" 2>/dev/null && log "  restarted $unit (no hanging MIDI notes)"
+  return 0
+}
+
 # quit_session SESSION START CGROUP: close the game the tile started, then Heroic.
 quit_session() {
   local sid=$1 start=$2 cg=${3:-} round
@@ -114,12 +126,15 @@ quit_session() {
     return 0
   fi
   # Twice: a game closing can start one last program (Wine, for one, can start its crash handler).
+  local closed=
   for round in 1 2; do
     mapfile -t games < <(game_pids "$sid" "$cg")
     ((${#games[@]})) || break
     log "quit: closing the game: $(names "${games[@]}")"
     close "$GAME_GRACE" "${games[@]}"
+    closed=1
   done
+  [[ -n $closed ]] && reset_midi
   if downloading "$sid" "$cg"; then
     log "quit: downloads still running; Heroic closes once the queue is empty"
     setsid -f "$0" quit-when-downloaded "$sid" "$cg" </dev/null >/dev/null 2>&1
@@ -169,7 +184,7 @@ if [[ $(stat_field $$ 4) == "$$" ]]; then
   log "start: session $$ for Sunshine $OWNER, ${CGROUP:-no systemd scope, so the session alone: Windows games can stay open}"
 fi
 
-[[ -n ${HEROIC_TV_KEEP_LOCAL_PADS:-} ]] || export SDL_GAMECONTROLLER_IGNORE_DEVICES=${HEROIC_TV_IGNORE_PADS:-0x045e/0x0b12}
+[[ -n ${HEROIC_TV_KEEP_LOCAL_PADS:-} ]] || export SDL_GAMECONTROLLER_IGNORE_DEVICES=${HEROIC_TV_IGNORE_PADS:-0x045e/0x0b12,0x28de/0x11ff}
 
 # Only one Heroic can run (a second one hands its arguments to the first and exits), and Wayland won't move the open
 # one to the streamed screen: close it. Its download queue is saved and resumes in the new one.

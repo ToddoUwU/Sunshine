@@ -1,0 +1,174 @@
+#!/usr/bin/python3 -I
+"""pad-assist PROFILE -- COMMAND...: run COMMAND (a game) and, while it runs, turn controller input into the mouse and
+keyboard input the game wants. The controller keeps working as a controller too: nothing is grabbed, this only adds.
+
+For games whose menus only take a mouse (A.I.M. Racing), so they can be played from the couch with just a pad.
+Meant as a Heroic per-game wrapper (Game settings > Advanced > Wrapper command: exe = this file, arguments =
+"PROFILE --"); it then starts and stops with the game, from the desk or from a Sunshine tile.
+
+Profiles (PROFILES below):
+  aim   left stick moves the pointer, A clicks, Start = Esc, RT = Up arrow (accelerate), LT = Down arrow (brake)
+
+The pointer is an absolute pointing device, which COSMIC maps onto one screen (the ASUS, DP-1), so a stick can't push
+it onto the other screen, where a click would take the game out of focus.
+Every controller counts except Steam's virtual copies of real ones (28de:11ff) and anything in
+SDL_GAMECONTROLLER_IGNORE_DEVICES (what the game itself is told to ignore). Controllers that turn up later (a Moonlight
+stream that starts or resumes) are picked up within two seconds.
+Log: ~/.local/state/pad-assist.log
+"""
+import os, select, signal, subprocess, sys, threading, time
+from evdev import AbsInfo, InputDevice, UInput, ecodes as e, list_devices
+
+PROFILES = {
+    "aim": {
+        "buttons": {e.BTN_SOUTH: ("mouse", e.BTN_LEFT), e.BTN_START: ("key", e.KEY_ESC)},
+        "triggers": {"right": e.KEY_UP, "left": e.KEY_DOWN},
+    },
+}
+W, H = 4096, 4096          # pointer device resolution (COSMIC scales it onto the screen)
+SPEED = 1.1                # full stick: screen widths per second
+DEADZONE = 0.18
+TRIGGER_ON, TRIGGER_OFF = 0.35, 0.2
+TICK = 1 / 125
+LOG = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "pad-assist.log")
+OWN = ("pad-assist pointer", "pad-assist keyboard")
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(time.strftime("%F %T ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def ignored_ids():
+    ids = {(0x28DE, 0x11FF)}
+    for item in os.environ.get("SDL_GAMECONTROLLER_IGNORE_DEVICES", "").split(","):
+        try:
+            v, p = item.strip().split("/")
+            ids.add((int(v, 16), int(p, 16)))
+        except ValueError:
+            pass
+    return ids
+
+
+class Pad:
+    """One controller: its left stick and triggers normalised, whatever driver it comes through."""
+
+    def __init__(self, dev):
+        self.dev, caps = dev, dev.capabilities(absinfo=True)
+        self.abs = {code: info for code, info in caps.get(e.EV_ABS, [])}
+        # Bluetooth Xbox pads (and Sunshine's copy of one) report the triggers as gas/brake (and the right stick as
+        # Z/RZ); xpad-style pads report the triggers as Z/RZ.
+        if e.ABS_GAS in self.abs or e.ABS_BRAKE in self.abs:
+            self.trig = {"right": e.ABS_GAS, "left": e.ABS_BRAKE}
+        else:
+            self.trig = {"right": e.ABS_RZ, "left": e.ABS_Z}
+        self.val = {code: info.value for code, info in self.abs.items()}
+
+    def axis(self, code):  # -1..1 around the middle of the range
+        info = self.abs.get(code)
+        if not info or info.max == info.min:
+            return 0.0
+        mid = (info.max + info.min) / 2
+        return max(-1.0, min(1.0, (self.val.get(code, mid) - mid) / ((info.max - info.min) / 2)))
+
+    def trigger(self, side):  # 0..1
+        info = self.abs.get(self.trig[side])
+        if not info or info.max == info.min:
+            return 0.0
+        return max(0.0, min(1.0, (self.val.get(self.trig[side], info.min) - info.min) / (info.max - info.min)))
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) < 2 or args[0] not in PROFILES:
+        sys.exit(__doc__)
+    prof = PROFILES[args[0]]
+    cmd = args[2:] if args[1] == "--" else args[1:]
+
+    pointer = UInput({e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                      e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, W - 1, 0, 0, 0)), (e.ABS_Y, AbsInfo(0, 0, H - 1, 0, 0, 0))]},
+                     name=OWN[0])
+    keyboard = UInput({e.EV_KEY: [e.KEY_ESC, e.KEY_ENTER, e.KEY_UP, e.KEY_DOWN, e.KEY_LEFT, e.KEY_RIGHT, e.KEY_SPACE]},
+                      name=OWN[1])
+    child = subprocess.Popen(cmd)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, f: child.send_signal(s))
+    log(f"start {args[0]}: {' '.join(cmd)[:200]}")
+
+    pads, skip = {}, ignored_ids()
+    x, y = W / 2, H / 2
+    held = {"right": False, "left": False}
+    moved = False
+    last_scan = 0.0
+    stop = threading.Event()
+    threading.Thread(target=lambda: (child.wait(), stop.set()), daemon=True).start()
+
+    while not stop.is_set():
+        now = time.monotonic()
+        if now - last_scan > 2:
+            last_scan = now
+            for path in list_devices():
+                if path in pads:
+                    continue
+                try:
+                    dev = InputDevice(path)
+                    caps = dev.capabilities(absinfo=False)
+                    if dev.name in OWN or (dev.info.vendor, dev.info.product) in skip:
+                        dev.close(); continue
+                    if e.BTN_SOUTH not in caps.get(e.EV_KEY, []) or e.ABS_X not in caps.get(e.EV_ABS, []):
+                        dev.close(); continue
+                    pads[path] = Pad(dev)
+                    log(f"controller: {dev.name} ({dev.info.vendor:04x}:{dev.info.product:04x}) {path}")
+                except OSError:
+                    pass
+        ready = select.select([p.dev.fd for p in pads.values()], [], [], TICK)[0] if pads else (time.sleep(TICK) or [])
+        for path, pad in list(pads.items()):
+            if pad.dev.fd not in ready:
+                continue
+            try:
+                for ev in pad.dev.read():
+                    if ev.type == e.EV_ABS:
+                        pad.val[ev.code] = ev.value
+                    elif ev.type == e.EV_KEY and ev.code in prof["buttons"] and ev.value in (0, 1):
+                        kind, out = prof["buttons"][ev.code]
+                        dev = pointer if kind == "mouse" else keyboard
+                        dev.write(e.EV_KEY, out, ev.value); dev.syn()
+            except OSError:  # unplugged (a stream ended)
+                log(f"controller gone: {path}")
+                pad.dev.close(); del pads[path]
+        # Pointer: the strongest stick deflection among the pads moves it.
+        dx = dy = 0.0
+        for pad in pads.values():
+            sx, sy = pad.axis(e.ABS_X), pad.axis(e.ABS_Y)
+            if abs(sx) + abs(sy) > abs(dx) + abs(dy):
+                dx, dy = sx, sy
+        mag = (dx * dx + dy * dy) ** 0.5
+        if mag > DEADZONE:
+            scale = ((min(mag, 1.0) - DEADZONE) / (1 - DEADZONE)) ** 2 * SPEED * W * TICK / mag
+            x = max(0, min(W - 1, x + dx * scale))
+            y = max(0, min(H - 1, y + dy * scale * 16 / 9))  # same speed on screen both ways
+            pointer.write(e.EV_ABS, e.ABS_X, int(x)); pointer.write(e.EV_ABS, e.ABS_Y, int(y)); pointer.syn()
+            if not moved:
+                moved = True
+                log("pointer in use")
+        # Triggers to keys, with hysteresis.
+        for side, key in prof["triggers"].items():
+            t = max((p.trigger(side) for p in pads.values()), default=0.0)
+            on = t > (TRIGGER_OFF if held[side] else TRIGGER_ON)
+            if on != held[side]:
+                held[side] = on
+                keyboard.write(e.EV_KEY, key, int(on)); keyboard.syn()
+
+    for side, key in prof["triggers"].items():
+        if held[side]:
+            keyboard.write(e.EV_KEY, key, 0); keyboard.syn()
+    pointer.close(); keyboard.close()
+    log(f"stop {args[0]}: exit {child.returncode}")
+    sys.exit(child.returncode if child.returncode is not None and child.returncode >= 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -56,6 +56,16 @@ check "a second quit with no tile closes nothing" alive "$A"
 
 echo "== heroic-tv"
 export HEROIC_TV_STATE=$T/heroic HEROIC_TV_APP=$T/app/heroic HEROIC_TV_QUEUE=$T/queue.json HEROIC_TV_EXEC=$T/fake-heroic
+# A stand-in for the fluidsynth service, so the real one is never restarted: systemctl calls about it are only logged.
+export FLUIDSYNTH_UNIT=fake-midi.service
+mkdir -p "$T/sysbin"
+cat >"$T/sysbin/systemctl" <<EOF
+#!/usr/bin/env bash
+[[ " \$* " == *" fake-midi.service "* ]] && { echo "\$*" >>"$T/midi.log"; exit 0; }
+exec /usr/bin/systemctl "\$@"
+EOF
+chmod +x "$T/sysbin/systemctl"
+export PATH=$T/sysbin:$PATH
 cp "$(command -v bash)" "$T/app/heroic"
 echo '{"queue": []}' >"$T/queue.json"
 # The fake Heroic starts a fake game and, if $T/with-download exists, a fake gogdl download.
@@ -93,6 +103,7 @@ check "fake game is running" alive "$G"
 TILE_OWNER=$COUCH "$HERE/heroic-tv" quit
 check "quit closes the game (in its own session, found through the scope)" wait_dead "$G" 30
 check "quit closes Heroic" wait_dead "$H" 30
+check "quit restarts fluidsynth after closing a game (hanging MIDI notes)" grep -q "restart fake-midi.service" "$T/midi.log"
 check "session file removed" test ! -e "$T/heroic/session.$COUCH"
 
 touch "$T/with-download"
