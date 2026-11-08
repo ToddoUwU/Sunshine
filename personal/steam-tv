@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Sunshine "Steam Big Picture" tile.
+#   steam-tv        the tile's command: open Steam in Big Picture, and remember when this tile started
+#   steam-tv quit   the tile's undo command, which Sunshine runs when Moonlight quits the session: close the Steam games
+#                   launched since this tile started, then close Big Picture. Saving is up to you.
+#
+# Steam is one program shared by everything, so unlike quiver-tv and heroic-tv the tile can't own it. Instead each Steam
+# game runs under its own `reaper SteamLaunch AppId=N` process, which keeps every process of that game (Proton, Wine,
+# the Steam Runtime container) under it. A game belongs to the tile that started most recently before it: the couch and
+# bed instances each have a Steam tile, and a phone opening the bed tile mid-game doesn't take over the couch's game.
+# Games already running before any tile started (launched at the desk) are never closed.
+#
+# Steam started by the tile runs in a systemd scope of its own, not inside Sunshine's service: restarting Sunshine
+# (`sunshine-host update`) would otherwise take Steam and its game down with it.
+#   Tile files: ~/.local/state/steam-tv/tile.<pid of the Sunshine it runs under> = "<tile start time in ticks>"
+#   Log: ~/.local/state/steam-tv/tv.log
+set -uo pipefail
+
+TILE_STATE=${STEAM_TV_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/steam-tv}
+STEAM=${STEAM_TV_STEAM:-steam} # tests point it elsewhere
+GAME_GRACE=8                   # seconds a game gets to close by itself before it's forced
+source "$(dirname "$(readlink -f "$0")")/tile-lib.sh"
+
+# Steam games: "PID START APPID" for every reaper SteamLaunch process.
+steam_games() {
+  local pid args
+  for pid in $(pgrep -u "$USER" -x reaper); do
+    args=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    [[ $args == *SteamLaunch* ]] || continue
+    [[ $args =~ AppId=([0-9]+) ]] && echo "$pid $(stat_field "$pid" 20) ${BASH_REMATCH[1]}"
+  done
+}
+
+# The tile a game belongs to: the newest tile start at or before the game's own start. Prints the tile's Sunshine pid.
+game_owner() {
+  local game_start=$1 f t best= best_t=-1
+  for f in "$TILE_STATE"/tile.*; do
+    [[ -f $f ]] || continue
+    read -r t <"$f" || continue
+    ((t <= game_start && t > best_t)) && { best_t=$t; best=${f##*.}; }
+  done
+  echo "$best"
+}
+
+case ${1:-} in
+  quit)
+    me=$(owner)
+    if [[ ! -f $TILE_STATE/tile.$me ]]; then
+      log "quit: Sunshine $me has no Steam tile on record; closing Big Picture only"
+    else
+      while read -r pid start appid; do
+        [[ -n $pid && $(game_owner "$start") == "$me" ]] || continue
+        mapfile -t procs < <(descendants "$pid")
+        log "quit: closing Steam game $appid: $(names "${procs[@]}")"
+        close "$GAME_GRACE" "${procs[@]}"
+        alive "$pid" && close 2 "$pid" # the reaper ends by itself once its game has; this is in case it doesn't
+      done < <(steam_games)
+      rm -f "$TILE_STATE/tile.$me"
+    fi
+    # Only if Steam is running: a steam:// link starts Steam when it isn't.
+    pgrep -u "$USER" -x "${STEAM_TV_PROC:-steam}" >/dev/null &&
+      setsid -f "$STEAM" steam://close/bigpicture </dev/null >/dev/null 2>&1
+    exit 0 ;;
+  "") ;;
+  *) sed -n '2,6p' "$0"; exit 1 ;;
+esac
+
+prune_tiles tile
+me=$(owner)
+stat_field $$ 20 >"$TILE_STATE/tile.$me"
+log "start: Steam tile for Sunshine $me"
+if systemctl --user show -p Version --value >/dev/null 2>&1; then
+  exec systemd-run --user --scope --collect --quiet --description="Steam (opened by the Sunshine Steam tile)" -- \
+    "$STEAM" steam://open/bigpicture
+fi
+exec "$STEAM" steam://open/bigpicture

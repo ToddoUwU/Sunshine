@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Sunshine "Heroic" tile.
+#   heroic-tv        the tile's command: close a Heroic that's already open and start a fresh one in its controller UI
+#                    (Console Mode), fullscreen, on the screen being streamed (Wayland can't raise an open window).
+#                    Its downloads pick up where they left off in the fresh one.
+#   heroic-tv quit   the tile's undo command, which Sunshine runs when Moonlight quits the session: close the game the
+#                    tile started, then Heroic. If a download is still running, Heroic stays open until the download
+#                    queue is empty, then closes. Saving is up to you. Run by hand, it closes whatever a Heroic tile started.
+#
+# Same design as Quiver's quiver-tv: Sunshine starts the tile detached (`setsid heroic-tv` in apps.json), so it never
+# tracks Heroic itself. The tile runs in a systemd scope of its own (a cgroup, which no program can leave: Wine starts
+# every Windows game in a new session, cut off from its parent) and in a session of its own (from setsid; used alone
+# where systemd can't be reached). Both are written to ~/.local/state/heroic-tv/session.<pid of the Sunshine it runs
+# under>, so each Sunshine (couch, bed) only closes what its own tile started, never a Heroic opened at the desk.
+# Log: ~/.local/state/heroic-tv/tv.log
+#
+# Controllers: this PC's own pad, left connected at the desk, would otherwise take player 1 from the pad Moonlight
+# passes through. For anything started from here, only Moonlight's pad counts. Set HEROIC_TV_KEEP_LOCAL_PADS=1 to keep them.
+set -uo pipefail
+
+TILE_STATE=${HEROIC_TV_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/heroic-tv}
+HEROIC=${HEROIC_TV_EXEC:-$HOME/.local/bin/heroic}                                    # what the tile starts (tests point it elsewhere)
+HEROIC_APP=${HEROIC_TV_APP:-$HOME/HeroicGamesLauncher/dist/linux-unpacked/heroic}     # Heroic's own binary, to tell its processes apart
+QUEUE=${HEROIC_TV_QUEUE:-$HOME/.config/heroic/store/download-manager.json}
+GAME_GRACE=8   # seconds a game gets to close by itself before it's forced
+HEROIC_GRACE=8 # the same for Heroic
+source "$(dirname "$(readlink -f "$0")")/tile-lib.sh"
+
+is_heroic() {
+  local exe; exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+  [[ $exe == "$HEROIC_APP" || $exe == "${HEROIC_APP%/*}/chrome_crashpad_handler" ]]
+}
+# Heroic's main process: its renderer, GPU and zygote processes carry --type=, and a child it has only just forked
+# (to run a helper) is still a copy of Heroic for a moment, with Heroic as its parent.
+is_heroic_main() {
+  is_heroic "$1" && ! tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null | grep -q -- ' --type=' &&
+    ! is_heroic "$(stat_field "$1" 2)"
+}
+running() { local pid; for pid in $(pgrep -u "$USER" -x heroic); do is_heroic_main "$pid" && echo "$pid"; done; }
+
+# Heroic's store helpers. Downloading, installing, updating or repairing is Heroic's own work; `launch` starts a game.
+is_download() {
+  is_heroic "$1" && return 1
+  local args; args=" $(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)" || return 1
+  [[ $args =~ (gogdl|nile|legendary) && $args =~ \ (download|install|update|repair|verify|import|move)\  ]]
+}
+is_helper() {
+  is_heroic "$1" && return 1
+  local args; args=" $(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)" || return 1
+  [[ $args =~ (gogdl|nile|legendary|comet|vulkan-helper|butler) && ! $args =~ \ launch\  ]]
+}
+
+# Every process the tile started: members SESSION CGROUP
+members() {
+  { [[ -n $2 && -d /sys/fs/cgroup$2 ]] && find "/sys/fs/cgroup$2" -name cgroup.procs -exec cat {} + 2>/dev/null
+    ps -u "$UID" -o pid=,sid= | awk -v s="$1" '$2 == s { print $1 }'; } | sort -un
+}
+
+# What to close first: everything the tile started that isn't Heroic, its helpers or this script.
+game_pids() {
+  local pid
+  for pid in $(members "$1" "$2"); do
+    [[ $pid == "$$" ]] && continue
+    alive "$pid" || continue
+    is_heroic "$pid" || is_helper "$pid" && continue
+    [[ $(cat "/proc/$pid/comm" 2>/dev/null) == heroic-tv ]] && continue
+    echo "$pid"
+  done
+}
+downloading() {
+  local pid
+  for pid in $(members "$1" "$2"); do is_download "$pid" && return 0; done
+  python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("queue") else 1)' "$QUEUE" 2>/dev/null
+}
+heroic_pids() { local pid; for pid in $(members "$1" "$2"); do is_heroic_main "$pid" && echo "$pid"; done; }
+
+close_heroic() {
+  local sid=$1 cg=$2; local -a mains rest
+  mapfile -t mains < <(heroic_pids "$sid" "$cg")
+  if ((${#mains[@]} == 0)); then log "quit: Heroic was already closed"; else
+    log "quit: closing Heroic: $(names "${mains[@]}")"
+    close "$HEROIC_GRACE" "${mains[@]}"
+  fi
+  mapfile -t rest < <(members "$sid" "$cg" | grep -vx "$$")
+  ((${#rest[@]})) && { log "  left behind, forced: $(names "${rest[@]}")"; kill -KILL "${rest[@]}" 2>/dev/null; }
+  return 0
+}
+
+# quit_session SESSION START CGROUP: close the game the tile started, then Heroic.
+quit_session() {
+  local sid=$1 start=$2 cg=${3:-} round
+  local -a games
+  if [[ -e /proc/$sid && $(stat_field "$sid" 20) != "$start" ]]; then
+    log "quit: session $sid now belongs to another program; nothing closed"
+    return 0
+  fi
+  # Twice: a game closing can start one last program (Wine, for one, can start its crash handler).
+  for round in 1 2; do
+    mapfile -t games < <(game_pids "$sid" "$cg")
+    ((${#games[@]})) || break
+    log "quit: closing the game: $(names "${games[@]}")"
+    close "$GAME_GRACE" "${games[@]}"
+  done
+  if downloading "$sid" "$cg"; then
+    log "quit: downloads still running; Heroic closes once the queue is empty"
+    setsid -f "$0" quit-when-downloaded "$sid" "$cg" </dev/null >/dev/null 2>&1
+    return 0
+  fi
+  close_heroic "$sid" "$cg"
+}
+
+case ${1:-} in
+  quit)
+    # From Sunshine, its own tile's session only. By hand, every tile session.
+    if [[ -n ${SUNSHINE_APP_ID:-} || -n ${TILE_OWNER:-} ]]; then files=("$TILE_STATE/session.$(owner)"); else files=("$TILE_STATE"/session.*); fi
+    for f in "${files[@]}"; do
+      [[ -f $f ]] || continue
+      read -r sid start cg <"$f" && quit_session "$sid" "$start" "$cg"
+      rm -f "$f"
+    done
+    exit 0 ;;
+  quit-when-downloaded)
+    sid=$2 cg=$3 idle=0
+    for _ in $(seq 1 8640); do # up to 12 hours; three quiet checks in a row, since the queue pauses between games
+      if downloading "$sid" "$cg"; then idle=0; else ((++idle >= 3)) && break; fi
+      [[ -n $(heroic_pids "$sid" "$cg") ]] || { log "quit: Heroic was closed before the downloads finished"; exit 0; }
+      sleep 5
+    done
+    log "quit: downloads finished"
+    close_heroic "$sid" "$cg"
+    exit 0 ;;
+  "") ;;
+  *) sed -n '2,9p' "$0"; exit 1 ;;
+esac
+
+# Remember what the tile starts, for `quit`, when started in a session of its own as the tile does. Started from a
+# terminal, the session is the terminal's, and closing it would close the terminal's programs too: nothing is kept then.
+CGROUP=
+if [[ $(stat_field $$ 4) == "$$" ]]; then
+  if [[ -z ${HEROIC_TV_SCOPED:-} ]] && systemctl --user show -p Version --value >/dev/null 2>&1; then
+    # Same process (systemd-run moves itself into the new scope and runs this again): same pid, session and parent.
+    export HEROIC_TV_SCOPED=1
+    exec systemd-run --user --scope --collect --quiet --description="Heroic tile (Sunshine $(owner))" -- "$0" "$@"
+  fi
+  [[ -n ${HEROIC_TV_SCOPED:-} ]] && CGROUP=$(sed -n 's/^0:://p' /proc/self/cgroup)
+  unset HEROIC_TV_SCOPED
+  prune_tiles session
+  OWNER=$(owner)
+  echo "$$ $(stat_field $$ 20) $CGROUP" >"$TILE_STATE/session.$OWNER"
+  log "start: session $$ for Sunshine $OWNER, ${CGROUP:-no systemd scope, so the session alone: Windows games can stay open}"
+fi
+
+[[ -n ${HEROIC_TV_KEEP_LOCAL_PADS:-} ]] || export SDL_GAMECONTROLLER_IGNORE_DEVICES=${HEROIC_TV_IGNORE_PADS:-0x045e/0x0b12}
+
+# Only one Heroic can run (a second one hands its arguments to the first and exits), and Wayland won't move the open
+# one to the streamed screen: close it. Its download queue is saved and resumes in the new one.
+for pid in $(running); do
+  log "start: closing the Heroic that was already open ($pid)"
+  close "$HEROIC_GRACE" "$pid"
+done
+exec "$HEROIC" --console --fullscreen

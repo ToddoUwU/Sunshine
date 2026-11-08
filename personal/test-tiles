@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Tests for steam-tv and heroic-tv with stand-in processes: nothing real (Steam, Heroic, games) is touched.
+# Stand-ins are copies of bash/sleep named like the real thing, since the scripts tell processes apart by name or path.
+#   personal/test-tiles      prints PASS/FAIL per check, exits non-zero on any failure
+set -uo pipefail
+HERE=$(dirname "$(readlink -f "$0")")
+T=$(mktemp -d "${TMPDIR:-/tmp}/test-tiles.XXXXXX")
+fails=0
+declare -a cleanup_pids=()
+trap 'kill -KILL "${cleanup_pids[@]}" 2>/dev/null; [[ -n ${KEEP:-} ]] && echo "kept $T" || rm -rf "$T"' EXIT
+ok()   { echo "PASS $*"; }
+bad()  { echo "FAIL $*"; fails=$((fails + 1)); }
+check() { local what=$1; shift; if "$@"; then ok "$what"; else bad "$what"; fi; }
+alive() { kill -0 "$1" 2>/dev/null && [[ $(ps -o stat= -p "$1") != Z* ]]; }
+dead()  { ! alive "$1"; }
+wait_dead() { for _ in $(seq 1 ${2:-100}); do dead "$1" && return 0; sleep 0.1; done; return 1; }
+tick() { sleep 0.3; } # start times are in 1/100 s; keep events apart
+
+mkdir -p "$T/bin" "$T/app"
+cp "$(command -v bash)" "$T/bin/reaper"
+cp "$(command -v sleep)" "$T/bin/gamebin"
+# Fake Sunshine pids: the tile files are keyed by a live Sunshine pid (dead ones get pruned).
+sleep 600 & COUCH=$!; sleep 600 & BED=$!; cleanup_pids+=("$COUCH" "$BED")
+
+echo "== steam-tv"
+export STEAM_TV_STATE=$T/steam STEAM_TV_STEAM=true STEAM_TV_PROC=nosteamproc
+# reaper PID for a fake game: a "reaper SteamLaunch AppId=N" process with two game processes under it.
+fake_game() {
+  setsid -f "$T/bin/reaper" -c "'$T/bin/gamebin' 600 & '$T/bin/gamebin' 600 & wait" SteamLaunch "AppId=$1" -- game </dev/null >/dev/null 2>&1
+  sleep 0.2; pgrep -n -f "SteamLaunch AppId=$1 "
+}
+A=$(fake_game 101); cleanup_pids+=("$A"); tick                      # running before any tile (the desk)
+TILE_OWNER=$COUCH "$HERE/steam-tv" </dev/null >/dev/null 2>&1; tick  # couch opens the Steam tile
+B=$(fake_game 102); cleanup_pids+=("$B"); tick                      # couch launches a game
+TILE_OWNER=$BED "$HERE/steam-tv" </dev/null >/dev/null 2>&1; tick    # a phone opens the bed tile
+C=$(fake_game 103); cleanup_pids+=("$C"); tick                      # launched after the bed tile
+check "tile files recorded for both instances" test -f "$T/steam/tile.$COUCH" -a -f "$T/steam/tile.$BED"
+B_KIDS=$(pgrep -P "$B" | tr '\n' ' ')
+TILE_OWNER=$BED "$HERE/steam-tv" quit
+check "bed quit closes the game launched after the bed tile" wait_dead "$C" 30
+check "bed quit leaves the couch game running" alive "$B"
+check "bed quit leaves the desk game running" alive "$A"
+check "bed tile file removed" test ! -e "$T/steam/tile.$BED"
+TILE_OWNER=$COUCH "$HERE/steam-tv" quit
+check "couch quit closes its game" wait_dead "$B" 30
+for k in $B_KIDS; do check "couch quit closes game process $k" wait_dead "$k" 30; done
+check "couch quit leaves the desk game running" alive "$A"
+TILE_OWNER=$COUCH "$HERE/steam-tv" quit
+check "a second quit with no tile closes nothing" alive "$A"
+
+echo "== heroic-tv"
+export HEROIC_TV_STATE=$T/heroic HEROIC_TV_APP=$T/app/heroic HEROIC_TV_QUEUE=$T/queue.json HEROIC_TV_EXEC=$T/fake-heroic
+cp "$(command -v bash)" "$T/app/heroic"
+echo '{"queue": []}' >"$T/queue.json"
+# The fake Heroic starts a fake game and, if $T/with-download exists, a fake gogdl download.
+cat >"$T/fake-heroic" <<EOF
+#!/usr/bin/env bash
+echo \$\$ >"$T/heroic.pid"   # exec keeps the pid: this is the fake Heroic's main process
+exec "$T/app/heroic" -c '
+  setsid -f "$T/bin/gamebin" 600                              # a Windows game: Wine puts it in a new session
+  [[ -e "$T/with-download" ]] && python3 -c "import time; time.sleep(600)" ./gogdl --auth-config-path x download 1 --path y &
+  trap "exit 0" TERM; while :; do sleep 0.2; done' "\$@"
+EOF
+chmod +x "$T/fake-heroic"
+heroic_main() { local p; p=$(cat "$T/heroic.pid" 2>/dev/null) && [[ $(readlink "/proc/$p/exe") == "$T/app/heroic" ]] && echo "$p"; }
+start_tile() {
+  # Sunshine runs the tile detached, in a session of its own; env execs, so heroic-tv is the session leader.
+  rm -f "$T/heroic.pid"
+  setsid -f env TILE_OWNER=$1 "$HERE/heroic-tv" </dev/null >/dev/null 2>&1
+  # The new one: a Heroic that was already open is still closing for a moment.
+  for _ in $(seq 1 50); do H=$(heroic_main); [[ -n $H && $H != "${2:-}" ]] && break; sleep 0.1; done
+  sleep 0.5; G=$(pgrep -n -f "$T/bin/gamebin 600"); cleanup_pids+=("$H" "$G")
+}
+
+start_tile "$COUCH"
+check "tile starts the fake Heroic" test -n "$H"
+check "tile recorded its session with a systemd scope" grep -q "\.scope" "$T/heroic/session.$COUCH"
+check "fake game is running" alive "$G"
+TILE_OWNER=$COUCH "$HERE/heroic-tv" quit
+check "quit closes the game (in its own session, found through the scope)" wait_dead "$G" 30
+check "quit closes Heroic" wait_dead "$H" 30
+check "session file removed" test ! -e "$T/heroic/session.$COUCH"
+
+touch "$T/with-download"
+start_tile "$COUCH"
+D=$(pgrep -n -f "gogdl --auth-config-path x download"); cleanup_pids+=("$D")
+check "fake download is running" test -n "$D"
+TILE_OWNER=$COUCH "$HERE/heroic-tv" quit
+check "quit during a download closes the game" wait_dead "$G" 30
+check "quit during a download keeps Heroic open" alive "$H"
+kill "$D"
+check "Heroic closes once the download is done" wait_dead "$H" 300
+
+rm -f "$T/with-download"
+start_tile "$COUCH"; H1=$H
+start_tile "$BED" "$H1"
+check "a second tile closes the Heroic that was open" wait_dead "$H1" 30
+TILE_OWNER=$COUCH "$HERE/heroic-tv" quit
+check "couch quit leaves the bed tile's Heroic alone" alive "$H"
+TILE_OWNER=$BED "$HERE/heroic-tv" quit
+check "bed quit closes its Heroic" wait_dead "$H" 30
+
+echo; ((fails)) && { echo "$fails check(s) failed"; exit 1; }; echo "all passed"

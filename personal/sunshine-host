@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Sunshine game-stream host, always from source (~/Sunshine). Moonlight on the Google TV Streamer connects to it.
+#
+#   sunshine-host update   sync your fork with upstream, rebuild + install if the source changed
+#                          (a fresh binary loses its KMS capability: this prints the sudo setcap line to run)
+#   sunshine-host start    start the user service (runs at login too)
+#   sunshine-host stop | restart | status | logs
+#   sunshine-host run      run in the foreground (what the service calls)
+#   sunshine-host web      open the web UI (pairing PIN, apps, settings)
+#   sunshine-host --bed <cmd>  same, for the second instance that streams the LG (DP-2) for bed devices
+#                          (start/stop/restart/status/logs/web/run; update and build are shared)
+#
+# Two instances run side by side, one per monitor, and each device pairs with only one of them:
+#   couch: ~/.config/sunshine/      DP-1 ASUS  port 47989 (web 47990)  sunshine-host.service      Google TV Streamer
+#   bed:   ~/.config/sunshine-bed/  DP-2 LG    port 48089 (web 48090)  sunshine-host-bed.service  everything else
+#
+# Fork layout: upstream = LizardByte/Sunshine (push disabled), origin = ToddoUwU/Sunshine.
+#   1. fork's master ← upstream/master (an exact mirror; never commit to master)
+#   2. PersonalUpdates ← origin/PersonalUpdates, then ← the fork's master (origin/master); pushed back to the fork
+# A merge that conflicts is aborted and nothing is rebuilt. Uncommitted edits to tracked files skip the merges.
+# Updates are manual (not on every start) so the setcap'd binary keeps working between updates.
+# Logs: ~/.local/state/sunshine-host/{git,build}.log; runtime logs: ~/.config/sunshine{,-bed}/sunshine.log
+set -uo pipefail
+
+REPO=${SUNSHINE_REPO:-$HOME/Sunshine}
+DIST=$REPO/dist
+BIN=$DIST/bin/sunshine
+NODE_BIN=$HOME/.nvm/versions/node/v24.15.0/bin # web UI build; nvm's default alias is broken, so pin a version
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/sunshine-host
+SERVICES=(sunshine-host.service sunshine-host-bed.service)
+if [[ ${1:-} == --bed ]]; then
+  shift; CONF=$HOME/.config/sunshine-bed/sunshine.conf; SERVICE=sunshine-host-bed.service; WEB_PORT=48090
+  LOG=$HOME/.config/sunshine-bed/sunshine.log
+else
+  CONF=$HOME/.config/sunshine/sunshine.conf; SERVICE=sunshine-host.service; WEB_PORT=47990
+  LOG=$HOME/.config/sunshine/sunshine.log
+fi
+mkdir -p "$STATE"
+
+say() { echo "sunshine-host: $*" >&2; }
+die() { say "$*"; exit 1; }
+
+sync_fork() {
+  local log=$STATE/git.log g=(git -C "$REPO")
+  echo "== $(date)" >>"$log"
+  timeout 120 "${g[@]}" fetch --quiet upstream 2>>"$log" || { say "offline? skipped update check"; return 0; }
+  timeout 120 "${g[@]}" fetch --quiet origin 2>>"$log" || true
+
+  if [[ $("${g[@]}" rev-parse upstream/master) != $("${g[@]}" rev-parse -q --verify origin/master) ]]; then
+    timeout 120 "${g[@]}" push --quiet origin upstream/master:refs/heads/master >>"$log" 2>&1 \
+      || say "couldn't push upstream master to your fork (see $log)"
+  fi
+  timeout 120 "${g[@]}" fetch --quiet origin master 2>>"$log" || true
+  if [[ $("${g[@]}" branch --show-current) != master ]] && "${g[@]}" rev-parse -q --verify origin/master >/dev/null; then
+    "${g[@]}" branch -f master origin/master >>"$log" 2>&1
+  fi
+
+  local branch; branch=$("${g[@]}" branch --show-current)
+  [[ $branch == PersonalUpdates ]] || { say "on branch '$branch', not PersonalUpdates; not merging updates"; return 0; }
+  local incoming=0 ref
+  for ref in origin/PersonalUpdates origin/master; do
+    "${g[@]}" rev-parse -q --verify "$ref" >/dev/null || continue
+    (( $("${g[@]}" rev-list --count "HEAD..$ref") > 0 )) && incoming=1
+  done
+  if ((incoming)) && [[ -n $("${g[@]}" status --porcelain --untracked-files=no --ignore-submodules) ]]; then
+    say "updates available, but you have uncommitted edits; commit them to PersonalUpdates first"; return 0
+  fi
+  for ref in origin/PersonalUpdates origin/master; do
+    "${g[@]}" rev-parse -q --verify "$ref" >/dev/null || continue
+    (( $("${g[@]}" rev-list --count "HEAD..$ref") > 0 )) || continue
+    say "merging $ref"
+    if ! "${g[@]}" merge --no-edit --quiet "$ref" >>"$log" 2>&1; then
+      "${g[@]}" merge --abort >>"$log" 2>&1
+      die "$ref conflicts with your PersonalUpdates commits; not merged. Resolve with: cd $REPO && git merge $ref"
+    fi
+  done
+  "${g[@]}" submodule update --init --recursive --jobs 8 >>"$log" 2>&1 || say "submodule update failed (see $log)"
+  if (( $("${g[@]}" rev-list --count origin/PersonalUpdates..HEAD 2>/dev/null || echo 1) > 0 )); then
+    timeout 120 "${g[@]}" push --quiet origin PersonalUpdates >>"$log" 2>&1 \
+      || say "couldn't push PersonalUpdates to your fork (see $log)"
+  fi
+}
+
+configure() {
+  # Sunshine only stamps a version on CI builds or on master, so a PersonalUpdates build shows 0.0.0-<sha> and the
+  # web UI nags to update. Pass the newest release tag in HEAD's history (configure-time, so re-run on every build).
+  local tag; tag=$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null)
+  BUILD_VERSION=$tag BRANCH=PersonalUpdates CC=gcc-14 CXX=g++-14 cmake -B "$REPO/build" -G Ninja -S "$REPO" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DIST" \
+    -DSUNSHINE_ASSETS_DIR=share/sunshine -DSUNSHINE_EXECUTABLE_PATH="$BIN" \
+    -DSUNSHINE_ENABLE_DRM=ON -DSUNSHINE_ENABLE_KWIN=OFF -DSUNSHINE_ENABLE_PORTAL=ON \
+    -DSUNSHINE_ENABLE_WAYLAND=ON -DSUNSHINE_ENABLE_X11=ON -DSUNSHINE_ENABLE_CUDA=OFF \
+    -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF
+}
+
+build() {
+  local log=$STATE/build.log stamp=$STATE/source.stamp src
+  src=$(git -C "$REPO" rev-parse HEAD)$(git -C "$REPO" status --porcelain --untracked-files=no | sha1sum)
+  [[ $(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null) == "$(cat "$STATE/version" 2>/dev/null)" ]] || rm -f "$stamp"
+  if [[ -x $BIN && -f $stamp && $(<"$stamp") == "$src" ]]; then say "already built"; return 0; fi
+  say "building (log: $log)"
+  export PATH=$NODE_BIN:$PATH
+  configure >"$log" 2>&1 || die "configure failed (see $log)"
+  ninja -C "$REPO/build" >>"$log" 2>&1 || die "build failed (see $log)"
+  # The install also wants /usr udev rules + a systemd unit: stage it and keep only dist/ (sunshine-host has its own unit)
+  rm -rf "$REPO/build/stage"
+  DESTDIR=$REPO/build/stage cmake --install "$REPO/build" >>"$log" 2>&1 || die "install failed (see $log)"
+  mkdir -p "$DIST" && rsync -a --delete "$REPO/build/stage$DIST/" "$DIST/" >>"$log" 2>&1 || die "install copy failed (see $log)"
+  echo "$src" >"$stamp"; git -C "$REPO" describe --tags --abbrev=0 >"$STATE/version" 2>/dev/null
+  say "built and installed to $DIST"
+}
+
+check_caps() {
+  if getcap "$BIN" 2>/dev/null | grep -q cap_sys_admin; then return 0; fi
+  say "the binary needs the KMS screen-capture capability. Run in your terminal:"
+  echo "  sudo setcap cap_sys_admin,cap_sys_nice+p $BIN" >&2
+  return 1
+}
+
+case ${1:-status} in
+  update)
+    sync_fork; build
+    if check_caps; then
+      for svc in "${SERVICES[@]}"; do
+        systemctl --user -q is-active "$svc" && systemctl --user restart "$svc"
+      done
+    fi ;;
+  build)   build; check_caps ;;
+  run)     check_caps || exit 1; exec "$BIN" "$CONF" ;;
+  start|stop|restart|status) systemctl --user "$1" "$SERVICE" ;;
+  logs)    exec tail -f "$LOG" ;;
+  web)     xdg-open "https://localhost:$WEB_PORT" ;;
+  *)       sed -n '2,16p' "$0"; exit 1 ;;
+esac
